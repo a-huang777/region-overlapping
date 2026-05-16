@@ -2,6 +2,11 @@
 
 基于 Stable Baselines3 的无人机覆盖扫描强化学习工程，采用分层架构：上层 PPO 负责区域分配，下层 PPO 负责点到点跟随控制。
 
+| 单智能体分层 RL（3D 轨迹） | 多智能体阶段一（俯视覆盖） |
+|:-----------:|:-----------:|
+| ![3D episode](Cover_multi/simulation/renders/high_level_3d_episode_1.gif) | ![multi eg](Cover_multi/simulation/renders/multi_eg.gif) |
+| 上层 PPO 选区域，下层 PPO 执行点到点跟随 | 集中式上层 PPO 同时为 3 个 agent 分配目标区域 |
+
 ---
 
 ## 目录结构
