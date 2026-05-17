@@ -385,7 +385,7 @@ def parse_args() -> argparse.Namespace:
         description="Render a 3D simulation for the multi-agent hierarchical coverage policy."
     )
     p.add_argument("--low-model",  default="Cover_multi/low_model/ppo_model_save.zip")
-    p.add_argument("--high-model", default="Cover_multi/check_point_multi_high_level/version_3/model/ppo_multi_hl_final.zip")
+    p.add_argument("--high-model", default="Cover_multi/check_point_multi_high_level/version_0/model/ppo_multi_hl_final.zip")
     p.add_argument("--output-dir", default="Cover_multi/simulation/renders")
     p.add_argument("--num-agents",     type=int,   default=3)
     p.add_argument("--episodes",       type=int,   default=5)
