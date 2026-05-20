@@ -1,185 +1,218 @@
-# UAV Coverage RL — Stable Baselines3
+# UAV Coverage PPO
 
-基于 Stable Baselines3 的无人机覆盖扫描强化学习工程，采用分层架构：上层 PPO 负责区域分配，下层 PPO 负责点到点跟随控制。
+基于 `Stable-Baselines3` 的无人机覆盖扫描强化学习实验仓库。当前仓库包含三套可独立运行的实验：
 
-| 单智能体分层 RL（3D 轨迹） | 多智能体阶段一（俯视覆盖） |
-|:-----------:|:-----------:|
-| ![3D episode](Cover_multi/simulation/renders/high_level_3d_episode_1.gif) | ![multi eg](Cover_multi/simulation/renders/multi_eg.gif) |
-| 上层 PPO 选区域，下层 PPO 执行点到点跟随 | 集中式上层 PPO 同时为 3 个 agent 分配目标区域 |
+- `single_uav_cover`：单无人机、单层 PPO 覆盖扫描
+- `single_uav_cover_hl`：单无人机、分层 PPO（上层选区域，下层做连续控制）
+- `multi_uav_cover_hl`：多无人机、集中式高层 PPO + 共享低层 PPO
 
----
+环境本体是二维覆盖任务；`simulation/` 里的脚本会把轨迹抬升到固定高度，导出 3D GIF 方便展示。
+
+| 单无人机 PPO | 单无人机分层 PPO | 多无人机分层 PPO |
+|---|---|---|
+| ![single](single_uav_cover/simulation/renders/high_level_3d_episode_1.gif) | ![single-hl](single_uav_cover_hl/simulation/renders/high_level_3d_episode_1.gif) | ![multi-hl](multi_uav_cover_hl/simulation/renders/multi_eg.gif) |
 
 ## 目录结构
 
-```
-stable_baseline3/
-├── Cover/                  # 单智能体分层 RL（已验证）
-│   ├── env.py              # 单/多 UAV 底层仿真环境
-│   ├── high_level_env.py   # 单智能体上层 Gym wrapper
-│   ├── train_high_level.py # 上层训练脚本
-│   └── model_test_high_level.py  # 推理 / 可视化
-│
-├── Cover_multi/            # 多智能体集中式分层 RL（阶段一）
-���   ├── env.py              # 多 UAV 底层仿真环境
-│   ├── multi_high_level_env.py   # 集中式多智能体上层 wrapper
-│   └── train_multi_high_level.py # 多智能体上层训练脚本
-│
-├── Cover_logic/            # 基于规则引导点的对比基线
+```text
+.
+├── single_uav_cover/
 │   ├── env.py
-│   ├── global_guidance.py  # 规则生成引导点
-│   └── train.py
-│
-└── PID/                    # PID 控制基线
+│   ├── global_guidance.py
+│   ├── train.py
+│   ├── model/                         # 仓库内置单层示例权重
+│   └── simulation/
+├── single_uav_cover_hl/
+│   ├── env.py
+│   ├── high_level_env.py
+│   ├── train_high_level.py
+│   ├── low_model/                     # 仓库内置低层示例权重
+│   ├── high_model/                    # 仓库内置高层示例权重
+│   └── simulation/
+└── multi_uav_cover_hl/
     ├── env.py
-    └── train.py
+    ├── multi_high_level_env.py
+    ├── train_multi_high_level.py
+    ├── low_model/                     # 仓库内置共享低层示例权重
+    ├── high_model/                    # 仓库内置多机高层示例权重
+    └── simulation/
 ```
 
----
+## 方法概览
 
-## 架构概览
+### 1. 单层 PPO
 
-### 分层结构
+`single_uav_cover/env.py` 直接定义二维覆盖环境：
 
-```
-上层 PPO（区域分配）
-    输出每个 agent 的目标区域 region_id
-        ↓
-    region_id → 区域中心世界坐标 guidance_point
-        ↓
-下层 PPO（点到点跟随，共享模型）
-    每个 agent 独立调用，输入自身观测 + guidance_point
-    输出连续动作 [v, w]（线速度 + 角速度）
-        ↓
-MultiUAVCoverageEnv.step(all_actions)
-```
+- 动作：连续 `Box`，每步输出 `[v, w]`
+- 奖励：新覆盖、重复覆盖惩罚、动作平滑、步长惩罚、引导点距离变化、终止奖励
+- 终止：碰撞 / 越界，或达到覆盖率目标
 
-### 上层决策节奏
+### 2. 单无人机分层 PPO
 
-每个上层 `step()` 包含两个退出条件：
+`single_uav_cover_hl/high_level_env.py` 的思路是：
 
-- 下层执行步数达到 `option_horizon`（默认 15 步）
-- **任意 agent 到达自己引导点的距离 < `early_reach_dist`（默认 4m）**，提前结束当前 option，立即触发新的上层决策
+1. 上层 PPO 选择离散区域 `region_id`
+2. 区域中心转成世界坐标引导点
+3. 下层 PPO 在 `option_horizon` 步内执行连续控制
+4. 上层根据覆盖增量、移动代价、切换代价等获得奖励
 
----
+### 3. 多无人机分层 PPO
 
-## 模块说明
+`multi_uav_cover_hl/multi_high_level_env.py` 使用集中式高层策略：
 
-### Cover_multi/multi_high_level_env.py
+- 动作空间：`MultiDiscrete([num_regions] * num_agents)`
+- 每个 agent 独立分配目标区域
+- 所有 agent 共享一个下层 PPO
+- team reward 会额外惩罚目标重复、目标过近、扫描重叠、机间过近和机间碰撞
 
-集中式多智能体上层环境，核心类 `MultiAgentHighLevelEnv`。
+## 环境依赖
 
-**动作空间**
+建议使用 `Python 3.10+`。最少需要：
 
-```python
-spaces.MultiDiscrete([num_regions] * num_agents)
-# 例：3 个 agent，25 个区域 → MultiDiscrete([25, 25, 25])
+```bash
+pip install numpy gymnasium matplotlib pillow torch stable-baselines3
 ```
 
-**观测空间**（扁平向量）
+如果你希望使用训练脚本里的 `progress_bar=True`，再补：
 
-| 分组 | 维度 | 内容 |
-|------|------|------|
-| 全局 | 2 | 覆盖率、step ratio |
-| 每个 agent | 7 × n | 位置、朝向、速度、最近邻距离、上轮区域 |
-| 每个区域 | 2 × R | 未覆盖比例、已扫描栅格数 |
-| agent-region 对 | 2 × n × R | 归一化距离、相对角度 |
-
-**奖励组成**
-
-| 项目 | 方向 | 权重 | 说明 |
-|------|------|------|------|
-| `w_cov * delta_cov` | + | 8.0 | 全局覆盖率增量 |
-| `w_new * delta_new` | + | 1.0 | 新覆盖栅格增量（归一化） |
-| `reach_bonus` | + | 0.15/agent | 从远处到达引导点 |
-| `r_cov_goal` | + | env_cfg | 达到覆盖目标一次性奖励 |
-| `w_travel` | - | 0.1 | 平均移动距离惩罚 |
-| `w_fail` | - | 2.0 | 碰撞障碍物或越界 |
-| `w_agent_collision` | - | 2.0 | agent 间碰撞 |
-| `w_duplicate` | - | 0.3/次 | 多 agent 选同一区域 |
-| `w_target_near` | - | 0.1 | 目标点间距 < `min_target_dist`(6m) |
-| `w_switch` | - | 0.03/次 | 切换目标区域 |
-| `w_scan_overlap` | - | 0.4 | 探测圆实时重叠比例 |
-| `w_agent_proximity` | - | 0.2 | agent 间距 < `min_agent_dist`(2m) |
-| `w_fully_scanned` | - | 0.5/agent | 目标区域已被完全扫描 |
-| `time_penalty` | - | 0.03 | 每步固定时间惩罚 |
-
-**关键配置参数（MultiHighLevelConfig）**
-
-```python
-max_high_steps: int = 80       # 上层最大宏观步数
-option_horizon: int = 15       # 每次决策下层最多执行步数
-grid_bins: int = 5             # 地图划分粒度（5×5=25 区域）
-reach_dist: float = 4.0        # reach_bonus 判定距离（m）
-early_reach_dist: float = 4.0  # 提前结束 option 的距离阈值（m）
-min_target_dist: float = 6.0   # 目标点过近惩罚阈值（m）
-min_agent_dist: float = 2.0    # agent 过近惩罚阈值（m）
+```bash
+pip install tqdm rich
 ```
 
----
+如果你使用 conda，仓库里的部分脚本已经内置了这些兼容处理：
+
+- `MKL_THREADING_LAYER=GNU`
+- `OMP_NUM_THREADS=1`
+- 多机脚本会优先使用当前 conda 环境里的 `libstdc++`
 
 ## 快速开始
 
-### 1. 训练下层单智能体模型
+### 单无人机 PPO
+
+训练：
 
 ```bash
-cd Cover
+cd single_uav_cover
 python train.py
 ```
 
-下层模型保存至 `Cover/low_model/ppo_model_save.zip`（路径可在脚本中配置）。
+输出位置：
 
-### 2. 训练多智能体上层模型
+- checkpoint：`single_uav_cover/check_point/version_N/model/`
+- TensorBoard：`single_uav_cover/check_point/version_N/tensorboard/`
+
+使用仓库内置示例权重导出 GIF：
 
 ```bash
-cd Cover_multi
+cd single_uav_cover
+python simulation/simulate_high_level_3d.py \
+  --model model/ppo_model_last.zip \
+  --episodes 1
+```
+
+### 单无人机分层 PPO
+
+当前仓库已经带了可直接可视化的示例权重：
+
+- 低层：`single_uav_cover_hl/low_model/ppo_low_last.zip`
+- 高层：`single_uav_cover_hl/high_model/ppo_high_last.zip`
+
+直接导出 GIF：
+
+```bash
+cd single_uav_cover_hl
+python simulation/simulate_high_level_3d.py \
+  --low-model low_model/ppo_low_last.zip \
+  --high-model high_model/ppo_high_last.zip \
+  --episodes 1
+```
+
+训练高层前要注意一件事：`train_high_level.py` 里的 `TrainHighLevelConfig.low_level_model_path` 默认值还是 `low_model/ppo_model_save.zip`，而仓库当前实际文件名是 `low_model/ppo_low_last.zip`。训练前需要先把这个路径改成你要用的低层模型。
+
+训练命令：
+
+```bash
+cd single_uav_cover_hl
+python train_high_level.py
+```
+
+输出位置：
+
+- checkpoint：`single_uav_cover_hl/check_point_high_level/version_N/model/`
+- TensorBoard：`single_uav_cover_hl/check_point_high_level/version_N/tensorboard/`
+
+### 多无人机分层 PPO
+
+仓库内置示例权重：
+
+- 低层：`multi_uav_cover_hl/low_model/ppo_low_last.zip`
+- 高层：`multi_uav_cover_hl/high_model/ppo_high_last.zip`
+
+训练高层：
+
+```bash
+cd multi_uav_cover_hl
 python train_multi_high_level.py \
-    --low_model low_model/ppo_model_save.zip \
-    --num_agents 3 \
-    --n_envs 8 \
-    --total_timesteps 2000000
+  --low_model low_model/ppo_low_last.zip \
+  --num_agents 3 \
+  --n_envs 8 \
+  --total_timesteps 2000000
 ```
 
-模型和 TensorBoard 日志保存至 `Cover_multi/check_point_multi_high_level/version_N/`。
+常用参数：
 
-**常用参数**
+- `--grid_bins`：区域划分粒度，默认 `5`
+- `--option_horizon`：每次高层决策下层执行步数，默认 `15`
+- `--max_high_steps`：每回合最大高层步数，默认 `80`
+- `--use_subproc`：启用 `SubprocVecEnv`
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--low_model` | `low_model/ppo_model_save.zip` | 下层模型路径 |
-| `--num_agents` | 3 | 智能体数量 |
-| `--n_envs` | 8 | 并行环境数 |
-| `--total_timesteps` | 2,000,000 | 总训练步数 |
-| `--grid_bins` | 5 | 区域划分粒度 |
-| `--option_horizon` | 15 | 每次决策下层步数 |
-| `--max_high_steps` | 80 | 上层最大宏观步数 |
-| `--use_subproc` | False | 使用多进程并行（SubprocVecEnv） |
+输出位置：
 
-### 3. 查看训练曲线
+- checkpoint：`multi_uav_cover_hl/check_point_multi_high_level/version_N/model/`
+- TensorBoard：`multi_uav_cover_hl/check_point_multi_high_level/version_N/tensorboard/`
+
+导出 GIF：
 
 ```bash
-tensorboard --logdir Cover_multi/check_point_multi_high_level/version_N/tensorboard
+cd multi_uav_cover_hl
+python simulation/simulate_high_level_3d.py \
+  --low-model low_model/ppo_low_last.zip \
+  --high-model high_model/ppo_high_last.zip \
+  --num-agents 3 \
+  --episodes 1
 ```
 
----
+## TensorBoard
 
-## 设计说明
+单无人机 PPO：
 
-### 为什么分层
+```bash
+tensorboard --logdir single_uav_cover/check_point
+```
 
-下层点到点跟随已经验证有效，上层只需学习"去哪里"而不是"怎么飞"，大幅降低上层策略的探索难度。
+单无人机分层 PPO：
 
-### 为什么用集中式 PPO（阶段一）
+```bash
+tensorboard --logdir single_uav_cover_hl/check_point_high_level
+```
 
-- 实现最接近单智能体结构，工程风险低
-- 训练稳定，便于调试
-- 先验证多 agent 共享下层模型的可行性
+多无人机分层 PPO：
 
-阶段二计划升级为 MAPPO（集中训练、分散执行），参见 `Cover_multi/multi_agent_hierarchical_rl_design.md`。
+```bash
+tensorboard --logdir multi_uav_cover_hl/check_point_multi_high_level
+```
 
-### 已扫描区域惩罚
+## 运行约定
 
-上层 action 指向已被完全扫描的区域时触发 `w_fully_scanned` 惩罚，引导策略主动探索未覆盖区域，避免无效重复扫描。
+- 这些脚本多数使用了 `from env import ...` 这样的本地导入，所以请进入各自子目录后再执行。
+- `simulation/` 里的默认模型路径并不完全都和当前仓库重构后的目录一致；最稳妥的方式是像上面的示例一样显式传参。
+- 训练脚本保存的新权重通常在 `check_point*` 目录下；而仓库里 `model/`、`low_model/`、`high_model/` 更多是示例或最近一次导出的权重。
 
-### 提前退出机制
+## 后续建议
 
-任意 agent 到达引导点（距离 < `early_reach_dist`）时立即结束当前 option，上层重新决策，提高宏观决策频率，减少 agent 在已到达目标附近原地徘徊的时间浪费。
+如果你准备继续迭代这个仓库，比较值得优先整理的是：
+
+1. 给三个实验统一补一份 `requirements.txt` 或 `environment.yml`
+2. 统一模型文件命名，消除 `ppo_model_save.zip` / `ppo_low_last.zip` 这类历史残留
+3. 把各训练脚本都补成完整 CLI，避免必须手改源码参数
